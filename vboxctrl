@@ -1,0 +1,463 @@
+#!/opt/venvs/vboxctrl/bin/python3
+import sys
+import argparse
+import json
+import subprocess
+import getpass
+import time
+import re
+import os
+import fcntl
+import socket
+from struct import *
+import traceback
+
+STRUCT_UNPACK_ARGS = '!6s96s' # https://docs.python.org/3/library/struct.html
+
+def callProcess(cmd, live_output=False, printcmd=False, curdir="/", valid_returncodes=[0,], root=False, as_user=""):
+	output = ""
+
+	if printcmd:
+		print(cmd)
+
+	if root or getpass.getuser() == "root":
+		# Run as root, do we need to use root to run as different user though?
+		if as_user != "":
+			cmd = "sudo su -c \"%s\" %s" % (cmd, as_user)
+		else:
+			if getpass.getuser() != "root":
+				cmd = "sudo " + cmd	
+
+	process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=True, cwd=curdir)
+
+	if live_output:
+		for line in iter(process.stdout.readline, ''):
+			if len(line) > 0:
+				print(line.decode("ascii", "ignore").rstrip("\n"))
+				output = output + line.decode("ascii", "ignore")
+			else:
+				break
+
+		process.communicate()
+	else:
+		data   = process.communicate()
+		output = data[0].decode("utf-8")
+
+	if not process.returncode in valid_returncodes:
+		raise subprocess.CalledProcessError(process.returncode, cmd=cmd, output=output)
+
+	return output
+
+class Singleton(type):
+    _instances = {}
+    def __call__(cls, *args, **kwargs):
+        if cls not in cls._instances:
+            cls._instances[cls] = super(Singleton, cls).__call__(*args, **kwargs)
+        return cls._instances[cls]
+
+class BroadCastReceiver:
+
+	def __init__(self, port, msg_len=8192, timeout=15):
+		self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+		self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+		#self.sock.settimeout(timeout)
+		self.msg_len = msg_len
+		self.sock.bind(('', port))
+
+	def __iter__(self):
+		return self
+
+	def __next__(self):
+		try:
+			data, addr = self.sock.recvfrom(self.msg_len)
+			return addr, data
+		except Exception as e:
+			print("Got exception trying to recv %s" % e)
+			raise StopIteration
+
+class VboxWolMonitor():
+	def __init__(self):
+		self.ctrl = Vboxctrl()
+		self.recv = BroadCastReceiver(9) # Port 9 is WOL broadcast port
+
+	def Run(self):
+		while True:
+			try:
+				for (address, data) in self.recv:
+					sync, mac = unpack(STRUCT_UNPACK_ARGS, data)
+
+					mac_hex = str(mac.hex()[:12])
+
+					print(":".join([mac_hex[x:x+2] for x in range(0,len(mac_hex),2)]))
+
+					for vm in self.ctrl.data["vms"]:
+						if vm["enabled"]:
+							installed_vms = callProcess("VBoxManage list vms", as_user=vm["user"])
+							running_vms   = callProcess("VBoxManage list runningvms", as_user=vm["user"])
+
+							vm_info = callProcess("VBoxManage showvminfo %s" % vm["uuid"], as_user=vm["user"]).split("\n")
+
+							nics = [x for x in [y for y in vm_info if y.startswith("NIC")] if any(z in x for z in ["Bridged Interface"])]
+
+							if len(nics) > 1:
+								print("More than one NIC with same mac address")
+
+							for nic in nics:
+								mac = nic.split(":", 1)[1].split(",")[0].strip().replace("MAC: ", "").lower()
+
+								if mac == mac_hex:
+									# We have a match, fire up the VM
+									
+									if not vm["uuid"] in running_vms and vm["uuid"] in installed_vms:
+										callProcess("VBoxManage startvm \"%s\" --type headless" % (vm["uuid"]), as_user=vm["user"])
+										print("Started VM \"%s\"" % (vm["uuid"]))
+									else:
+										print("VM \"%s\" is already running" % (vm["uuid"]))
+					
+			except Exception as e:
+				print("Caught global VboxWolMonitor exception %s" % (e))
+				print(traceback.print_exc())
+				return -1
+
+
+class Vboxctrl(metaclass=Singleton):
+	def __init__(self):
+		if not os.path.exists('/etc/vboxctrl/vboxctrl.json'):
+			print("File /etc/vboxctrl/vboxctrl.json does not exist")
+			sys.exit(1)
+
+		try:
+			with open('/etc/vboxctrl/vboxctrl.json') as f:
+				self.data = json.load(f)
+		except ValueError as e:
+			print("Unable to load Invalid json file /etc/vboxctrl/vboxctrl.json")
+			sys.exit(1)
+
+		return
+
+	def discover(self, args):
+		installed_vms = callProcess("VBoxManage list vms").rstrip()
+
+		list_vms = installed_vms.split("\n")
+
+		for item in list_vms:
+			n            = dict()
+			n["name"]    = item.split(" {")[0].replace("\"", "")
+			n["uuid"]    = re.sub("[{}]", "", item.split(" ")[1])
+			n["enabled"] = False
+			n["user"]    = getpass.getuser()
+
+			existing = next((x for x in self.data["vms"] if x["uuid"] == n["uuid"]), None)
+
+			if existing != None:
+				# VM already known to vboxctrl, update Name incase it has changed
+				existing["name"] = n["name"]
+			else:
+				# VM not known to vboxctrl, add new entry
+				self.data["vms"].append(n)
+
+
+		# Update vboxctrl.json
+		with open('/etc/vboxctrl/vboxctrl.json', 'w') as f:
+			f.write(json.dumps(self.data, indent=4))
+
+
+	def startall(self, args):
+		installed_vms = callProcess("VBoxManage list vms")
+		running_vms   = callProcess("VBoxManage list runningvms")
+
+		for vm in self.data["vms"]:
+			# Is the VM known to virtualbox
+			if vm["uuid"] in installed_vms:
+				# Known to virtualbox
+				# Is it running
+				if not vm["uuid"] in running_vms:
+					# Not running, then lets start it
+					callProcess("VBoxManage startvm \"%s\" --type headless" % (vm["uuid"]))
+					print("Started VM \"%s\"" % (vm["uuid"]))
+					break
+				else:
+					print("VM \"%s\" is already running" % (vm["uuid"]))
+					return 1
+			else:
+				print("VM \"%s\" unknown to virtualbox" % (vm["uuid"]))
+				return 1
+
+		return 0
+
+	def stopall(self, args):
+
+		running_vms = callProcess("VBoxManage list runningvms")
+
+		for vm in self.data["vms"]:
+			if vm["name"] in running_vms:
+				# Running VM, lets take it down
+				try:
+					callProcess("VBoxManage controlvm \"%s\" acpipowerbutton" % (vm["name"]))
+					break
+				except subprocess.CalledProcessError as e:
+					print("Failed to send acpipowerbutton to VM \"%s\"" % (vm["name"]))
+					return 1
+			else:
+				print("VM \"%s\" is not running" % (vm["name"]))
+				return 0
+
+		# Wait until VM has gone down, or timeout reached and we nuke it
+		start_time = int(time.time())
+
+		for vm in self.data["vms"]:
+			vm["shutdown_time"] = int(time.time())
+
+		while True:
+			running_vms = callProcess("VBoxManage list runningvms")
+
+			for itr, vm in enumerate(self.data["vms"][itr]):
+				if vm["name"] in running_vms:
+					if vm["shutdown_time"] >= int(time.time()) + int(self.data["timeout"]):
+						print("Reached timeout for \"%s\" shutdown, forcing shutdown now" % (vm["name"]))
+
+						try:
+							callProcess("VBoxManage controlvm \"%s\" poweroff" % (vm["name"]))
+							break
+						except subprocess.CalledProcessError as e:
+							print("Failed to send acpipowerbutton to VM \"%s\"" % (vm["name"]))
+							continue
+				else:
+					del self.data["vms"][itr]
+
+				time.sleep(1)
+
+			if len(self.data["vms"]) == 0:
+				break
+
+		return 0
+
+	def start(self, args):
+		if args["id"] == None:
+			print("id not defined")
+			return 1
+
+		id = args["id"]
+
+		installed_vms = callProcess("VBoxManage list vms")
+		running_vms   = callProcess("VBoxManage list runningvms")
+
+		for vm in self.data["vms"]:
+			if id == vm["name"] or id == vm["uuid"]:
+				# Valid managed VM
+				# Is the VM know to virtualbox
+				if id in installed_vms:
+					# Known to virtualbox
+					# Is it running
+					if not id in running_vms:
+						# Not running, then lets start it
+						callProcess("VBoxManage startvm \"%s\" --type headless" % (id))
+						print("Started VM \"%s\"" % (id))
+						break
+					else:
+						print("VM \"%s\" is already running" % (id))
+						return 1
+				else:
+					print("VM \"%s\"unknown to virtualbox" % (id))
+					return 1
+			else:
+				print("VM \"%s\"unknown to vboxctrl" % (id))
+				return 1
+
+		return 0
+
+	def stop(self, args):
+		if args["id"] == None:
+			print("id not defined")
+			return 1
+
+		id = args["id"]
+
+		running_vms = callProcess("VBoxManage list runningvms")
+
+		for vm in self.data["vms"]:
+			if id == vm["name"] or id == vm["uuid"]:
+				if id in running_vms:
+					# Running VM, lets take it down
+					try:
+						callProcess("VBoxManage controlvm \"%s\" acpipowerbutton" % (id))
+						break
+					except subprocess.CalledProcessError as e:
+						print("Failed to send acpipowerbutton to VM \"%s\"" % (id))
+						return 1
+				else:
+					print("VM \"%s\" is not running" % (id))
+					return 0
+
+		# Wait until VM has gone down, or timeout reached and we nuke it
+		start_time = int(time.time())
+
+		while True:
+			if start_time >= int(time.time()) + int(self.data["timeout"]):
+				print("Reached timeout for \"%s\" shutdown, forcing shutdown now" % (id))
+
+				try:
+					callProcess("VBoxManage controlvm \"%s\" poweroff" % (id))
+					break
+				except subprocess.CalledProcessError as e:
+					print("Failed to send acpipowerbutton to VM \"%s\"" % (id))
+					return 1
+
+			running_vms = callProcess("VBoxManage list runningvms")
+
+			if id in running_vms:
+				time.sleep(1)
+				continue
+
+		return 0
+
+	def enable(self, args):
+		if args["id"] == None:
+			print("id not defined")
+			return 1
+
+		id = args["id"]
+
+		for itr, vm in enumerate(self.data["vms"]):
+			if id == vm["name"] or id == vm["uuid"]:
+				self.data["vms"][itr]["enabled"] = True
+
+				f = open("/etc/vboxctrl/vboxctrl.json", "w")
+
+				f.write(json.dumps(self.data, indent=4, sort_keys=True))
+				f.close()
+
+				return 0
+
+		return 1
+
+	def disable(self, args):
+		if args["id"] == None:
+			print("id not defined")
+			return 1
+
+		id = args["id"]
+		
+		for itr, vm in enumerate(self.data["vms"]):
+			if id == vm["name"] or id == vm["uuid"]:
+				self.data["vms"][itr]["enabled"] = False
+
+				f = open("/etc/vboxctrl/vboxctrl.json", "w")
+
+				f.write(json.dumps(self.data, indent=4, sort_keys=True))
+				f.close()
+
+				return 0
+
+		return 1
+
+	def add(self, args):
+		if args["id"] == None:
+			print("id not defined")
+			return 1
+
+		for vm in self.data["vms"]:
+			if args["id"] == vm["name"] or args["id"] == vm["uuid"]:
+				print("ERROR: VM \"%s\" already added to vboxctrl" % (args["id"]))
+				return 1
+
+		vms = callProcess("VBoxManage list vms").split("\n")
+
+		match = next((x for x in vms if args["id"] in x), None)
+
+		if not match == None:
+			name = re.sub('["]', '', match.split("\" ")[0])
+			uuid = re.sub('[{}]', '', match.split("\" ")[1])
+
+			new_entry            = {}
+			new_entry["name"]    = name
+			new_entry["uuid"]    = uuid
+			new_entry["enabled"] = False
+
+			self.data["vms"].append(new_entry)
+
+			f = open("/etc/vboxctrl/vboxctrl.json", "w")
+
+			f.write(json.dumps(self.data, indent=4, sort_keys=True))
+			f.close()
+		else:
+			print("ERROR: Cant find valid VM with ID \"%s\"" % (args["id"]))
+			return 1
+
+		return 0
+
+	def remove(self, args):
+		if args["id"] == None:
+			print("id not defined")
+			return 1
+
+		id = args["id"]
+
+		for itr, vm in enumerate(self.data["vms"]):
+			if id == vm["name"] or id == vm["uuid"]:
+				del self.data["vms"][itr]
+
+				f = open("/etc/vboxctrl/vboxctrl.json", "w")
+
+				f.write(json.dumps(self.data, indent=4, sort_keys=True))
+				f.close()
+
+				return 0
+
+		print("ERROR: Failed to find valid VM")
+
+		return 1
+
+	def list(self, args):
+		print(json.dumps(self.data["vms"], indent=4, sort_keys=True))
+		
+		return 0
+
+	def woldaemon(self, args):
+		pid_file = '/tmp/vboxctrl-wol.pid'
+		fp       = open(pid_file, 'w')
+
+		try:
+			fcntl.lockf(fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+			mon = VboxWolMonitor()
+
+			mon.Run()
+
+			fcntl.lockf(fp, fcntl.LOCK_UN)
+
+		#except IOError:
+			# another instance is running
+		#	print("VboxWolMonitor instance already running")
+		#	sys.exit(0)
+
+		except Exception as e:
+			print("Unhandled exception from VboxWolMonitor: %s" % e)
+
+			print(traceback.print_exc())
+
+			fcntl.lockf(fp, fcntl.LOCK_UN)
+
+			sys.exit(1)
+
+def RunCmd():
+	parser = argparse.ArgumentParser(description='Control utility for automatic startup and shutdown of VirtualBox VM Machines')
+
+	cmds = dict((func, getattr(Vboxctrl, func)) for func in dir(Vboxctrl) if callable(getattr(Vboxctrl, func)) and not func.startswith("__"))
+
+	parser.add_argument('-c', '--cmd', help='Cmd to issue to vboxctrl', required=True, choices=cmds)
+	parser.add_argument('-i', '--id', help='ID of VM, be it the name or the uuid')
+	#parser.add_argument('-w', '--woldaemon', help='Start VM WOL interpreter for "waking up" VMs that are registered to vboxctrl and enabled')
+
+	args, unknown    = parser.parse_known_args()
+	vargs   = vars(args)
+	handler = Vboxctrl()
+
+	method = getattr(handler, vargs["cmd"])
+	return method(vargs)
+	#return method({"cmds": vargs["cmd"], "options": unknown})
+
+if __name__ == "__main__":
+	exitcode = RunCmd()
+	sys.stdout.flush()
+	sys.exit(exitcode)

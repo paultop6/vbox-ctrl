@@ -1,0 +1,25 @@
+[Unit]
+SourcePath=/usr/bin/vboxctrl
+Description=
+#Before=runlevel2.target runlevel3.target runlevel4.target runlevel5.target shutdown.target 
+#After=vboxdrv.service
+Conflicts=shutdown.target
+
+[Service]
+User=nas
+Group=nas
+Type=forking
+Restart=no
+TimeoutSec=5min
+IgnoreSIGPIPE=no
+KillMode=process
+GuessMainPID=no
+RemainAfterExit=yes
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=vboxctrl
+ExecStart=/usr/bin/vboxctrl --cmd startall
+ExecStop=/usr/bin/vboxctrl --cmd stopall
+
+[Install]
+WantedBy=multi-user.target

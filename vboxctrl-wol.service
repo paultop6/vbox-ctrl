@@ -1,0 +1,20 @@
+[Unit]
+SourcePath=/usr/bin/vboxctrl
+Description=
+
+[Service]
+User=root
+Group=root
+Type=simple
+Restart=yes
+TimeoutSec=5min
+IgnoreSIGPIPE=no
+KillMode=process
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=vboxctrl-wol
+ExecStart=/usr/bin/vboxctrl --cmd woldaemon
+
+[Install]
+WantedBy=multi-user.target
+
